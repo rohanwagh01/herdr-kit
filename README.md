@@ -9,6 +9,16 @@ Herdr itself is the application. The kit is an `hc` wrapper, six window mods, a 
 skill that install over a stock Herdr. It ships no agent templates and no automations: how you
 start agents, which roles exist, and what they talk to (tickets, chat, CI) stays yours.
 
+## Let a Claude install it
+
+From nothing (no Herdr yet) to a working window, with checks after each step: clone this repo,
+open Claude Code in it, and say
+
+> Read skills/setup-herdr/SKILL.md and follow it.
+
+It asks before downloading anything, never signs into services for you, and reports each step.
+To have it available in every session, link it: `ln -s "$PWD/skills/setup-herdr" ~/.claude/skills/`.
+
 ## Installation rules
 
 1. **Install Herdr first** (app and core) from [herdr.dev](https://herdr.dev) and open it once so
