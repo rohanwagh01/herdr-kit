@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""herdr-kit: install the fleet operating layer (hc wrapper, Board, freeze/restart/revive, panels) over a stock Herdr.
+
+  kit init [--config FILE] [--yes]        write ~/.herdr/kit.json (prompts, or copies FILE)
+  kit install [--with-peers] [--dry-run]  copy code, render templates, link skills, pick the layout
+  kit doctor                              check the installed kit
+  kit render herdr|intake                 print the rendered skill (or the peers intake template)
+  kit uninstall                           remove kit files that are unchanged since install; restore backups
+  kit paths                               where everything goes
+
+The kit never touches runtime state: ~/.herdr/state, ~/.herdr/messages, frozen, fleet, or anything
+under ~/.claude except one symlink. It installs no agent templates and no automations: how you start
+agents and what they do stays yours.
+HOME (or KIT_HOME) decides where it installs, so a throwaway home is a full test.
+"""
+import hashlib, json, os, re, shutil, subprocess, sys, time
+
+HOME = os.environ.get("KIT_HOME") or os.path.expanduser("~")
+TEST_HOME = bool(os.environ.get("KIT_HOME"))  # a throwaway home: never drive the running app or core from it
+KIT_JSON = os.path.join(HOME, ".herdr", "kit.json")
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__))))
+# Run from the checkout, _HERE is the repo. Run as the installed copy in ~/.herdr/bin, kit.json says where the repo is.
+REPO = _HERE if os.path.exists(os.path.join(_HERE, "kit.example.json")) else (lambda k: k.get("kit_repo") or _HERE)(
+    (lambda p: (lambda f: json.load(f))(open(p)) if os.path.exists(p) else {})(KIT_JSON))
+MANIFEST = os.path.join(HOME, ".herdr", "kit-manifest.json")
+BACKUPS = os.path.join(HOME, ".herdr", "kit-backup")
+APP_HOME = os.environ.get("HERDR_APP_HOME") or os.path.join(HOME, ".config", "herdr-app")
+CORE_HOME = os.path.join(HOME, ".config", "herdr-core")
+BIN = os.path.join(HOME, ".herdr", "bin")
+CLAUDE_SKILLS = os.path.join(HOME, ".claude", "skills")
+
+CORE_MODS = ["changes-cos", "files-cos", "tabs-board", "spaces-tabs", "menu-cos", "message-board"]
+PEER_MODS = ["peer-chat", "spaces-tabs-social", "menu-cos-social", "machine-add"]
+REQUIRED_TOOLS = {"herdr-app": "the Herdr app (https://herdr.dev)", "herdr-core": "herdr-core, installs hc",
+                  "git": "git", "python3": "python3"}
+STATE_DIRS = ["state", "messages", "frozen", "fleet", "restart", "tint"]
+
+
+def die(msg, code=1):
+    print(f"kit: {msg}", file=sys.stderr); sys.exit(code)
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
+
+def read(path):
+    with open(path, "rb") as f: return f.read()
+
+def load_json(path, default):
+    try:
+        with open(path) as f: return json.load(f)
+    except (OSError, ValueError): return default
+
+def save_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: json.dump(value, f, indent=2); f.write("\n")
+    os.replace(tmp, path)
+
+def example():
+    return {k: v for k, v in load_json(os.path.join(REPO, "kit.example.json"), {}).items() if not k.startswith("_")}
+
+def comments():
+    ex = load_json(os.path.join(REPO, "kit.example.json"), {})
+    return {k[1:]: v for k, v in ex.items() if k.startswith("_")}
+
+def kit():
+    k = load_json(KIT_JSON, None)
+    if k is None: die(f"no {KIT_JSON}; run `kit init` (install.sh does)")
+    return k
+
+def placeholders(k):
+    vals = {key.upper(): v for key, v in k.items() if not key.startswith("_")}
+    vals["WORKTREE_ROOT"] = vals.get("WORKTREE_ROOT") or f"~/.herdr/worktrees/{vals.get('REPO_NAME', 'repo')}"
+    return vals
+
+def render_text(text, vals, name):
+    def one(m):
+        key = m.group(1)
+        if key not in vals: die(f"{name}: no value for {{{{{key}}}}} in {KIT_JSON}")
+        v = vals[key]
+        return str(v) if not isinstance(v, bool) else ("true" if v else "false")
+    out = re.sub(r"\{\{([A-Z_]+)\}\}", one, text)
+    if "{{" in out: die(f"{name}: unrendered placeholder left")
+    return out
+
+def validate(k):
+    for key, v in k.items():
+        if key.startswith("_") or not isinstance(v, str): continue
+        if '"' in v or "\n" in v: die(f"kit.json {key}: no double quotes or newlines allowed")
+    if not k.get("owner"): die("kit.json: owner is required")
+
+
+# ---------------------------------------------------------------- init
+def cmd_init(args):
+    yes = "--yes" in args
+    cfg = None
+    if "--config" in args:
+        cfg = load_json(args[args.index("--config") + 1], None)
+        if cfg is None: die("--config file is missing or not JSON")
+        cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    if cfg is None:
+        if os.path.exists(KIT_JSON) and yes:
+            print(f"keeping {KIT_JSON}"); return
+        base = load_json(KIT_JSON, None) or example()
+        if yes:
+            cfg = base
+        else:
+            print("herdr-kit setup. Enter to keep the value in brackets.\n")
+            cfg, notes = {}, comments()
+            for key, default in example().items():
+                if isinstance(default, bool) or not isinstance(default, (str, int)):
+                    cfg[key] = base.get(key, default); continue
+                cur = base.get(key, default)
+                note = notes.get(key) or notes.get(key.split("_")[0]) or notes.get("repo" if key.startswith(("repo", "worktree", "base")) else key) or ""
+                if note: print(f"  {note}")
+                ans = input(f"{key} [{cur}]: ").strip()
+                if ans == "":
+                    cfg[key] = cur
+                elif isinstance(default, int) and not isinstance(default, bool):
+                    try: cfg[key] = int(ans)
+                    except ValueError: die(f"{key} must be a number")
+                else:
+                    cfg[key] = ans
+                print()
+    cfg.setdefault("peers", False)
+    cfg["kit_repo"] = REPO
+    validate(cfg)
+    save_json(KIT_JSON, cfg)
+    print(f"wrote {KIT_JSON}")
+
+
+# ---------------------------------------------------------------- install
+def plan_files(k, peers):
+    """Every (source path or rendered bytes, destination) the install writes."""
+    vals = placeholders(k)
+    files = []  # (dest, bytes, executable)
+    def add_tree(src_root, dest_root, exe=False):
+        for dirpath, _, names in os.walk(src_root):
+            for n in sorted(names):
+                if n.startswith(".") or n.endswith((".d.ts",)) or n == "jsconfig.json": continue
+                s = os.path.join(dirpath, n)
+                files.append((os.path.join(dest_root, os.path.relpath(s, src_root)), read(s), exe or os.access(s, os.X_OK)))
+    for n in ("hc", "hc_ext.py", "kit"):
+        files.append((os.path.join(BIN, n), read(os.path.join(REPO, "bin", n)), True))
+    for m in CORE_MODS: add_tree(os.path.join(REPO, "mods", m), os.path.join(APP_HOME, "mods", m))
+    layout = "main-tabs.peers.json" if peers else "main-tabs.json"
+    files.append((os.path.join(APP_HOME, "layouts", "main-tabs.json"), read(os.path.join(REPO, "layouts", layout)), False))
+    files.append((os.path.join(HOME, ".herdr", "tint", "colors.json"), read(os.path.join(REPO, "tint", "colors.json")), False))
+    files.append((os.path.join(CORE_HOME, "skills", "herdr", "SKILL.md"),
+                  render_text(read(os.path.join(REPO, "skills", "herdr", "SKILL.md.tmpl")).decode(), vals, "herdr skill").encode(), False))
+    if peers:
+        for n in ("intake.py", "peer.py"):
+            files.append((os.path.join(BIN, n), read(os.path.join(REPO, "peers", "bin", n)), True))
+        for m in PEER_MODS: add_tree(os.path.join(REPO, "peers", "mods", m), os.path.join(APP_HOME, "mods", m))
+        files.append((os.path.join(CORE_HOME, "templates", "intake.md"),
+                      render_text(read(os.path.join(REPO, "peers", "templates", "intake.md.tmpl")).decode(), vals, "intake").encode(), False))
+    return files
+
+def preflight(peers):
+    missing = [f"{t} ({why})" for t, why in REQUIRED_TOOLS.items() if not shutil.which(t) and not os.path.exists(os.path.join(HOME, ".local", "bin", t))]
+    if peers and not os.path.exists("/Applications/Tailscale.app/Contents/MacOS/Tailscale"): missing.append("Tailscale.app (peers add-on)")
+    if missing: die("missing tools: " + ", ".join(missing))
+
+def app_version():
+    try: return subprocess.run(["herdr-app", "--version"], capture_output=True, text=True, timeout=10).stdout.strip().split()[-1]
+    except Exception: return None
+
+def skew_warnings():
+    """Mods are clones of shipped mods pinned to the app version they were cloned at."""
+    cur = app_version(); warns = []
+    if not cur: return warns
+    for root in (os.path.join(REPO, "mods"), os.path.join(REPO, "peers", "mods")):
+        for m in sorted(os.listdir(root)):
+            cf = (load_json(os.path.join(root, m, "mod.json"), {}).get("cloned_from") or {})
+            if cf.get("version") and cf["version"] != cur:
+                warns.append(f"{m}: cloned from {cf['name']} {cf['version']}, app is {cur}; run `herdr-app check` after install")
+    return warns
+
+def cmd_install(args):
+    dry = "--dry-run" in args
+    k = kit()
+    peers = "--with-peers" in args or bool(k.get("peers"))
+    if "--with-peers" in args and not k.get("peers"):
+        k["peers"] = True
+        if not dry: save_json(KIT_JSON, k)
+    if "--skip-preflight" not in args: preflight(peers)
+    for w in skew_warnings(): print("warning:", w)
+    manifest = load_json(MANIFEST, {"files": {}})
+    manifest.setdefault("original", {})
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = os.path.join(BACKUPS, stamp)
+    written, kept, backed = [], [], []
+    files = plan_files(k, peers)
+    for dest, data, exe in files:
+        exists = os.path.exists(dest)
+        if exists and read(dest) == data:
+            continue
+        if exists:
+            known = manifest["files"].get(dest)
+            if known and known != sha(read(dest)):
+                # Edited by hand since the kit installed it: never overwrite, leave the new version beside it.
+                kept.append(dest)
+                if not dry:
+                    with open(dest + ".new", "wb") as f: f.write(data)
+                continue
+            b = os.path.join(backup_dir, os.path.relpath(dest, HOME))
+            backed.append(dest)
+            if not known and dest not in manifest["original"]: manifest["original"][dest] = b
+            if not dry:
+                os.makedirs(os.path.dirname(b), exist_ok=True); shutil.copy2(dest, b)
+        written.append(dest)
+        if not dry:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f: f.write(data)
+            if exe: os.chmod(dest, 0o755)
+        manifest["files"][dest] = sha(data)
+    for d in STATE_DIRS:
+        if not dry: os.makedirs(os.path.join(HOME, ".herdr", d), exist_ok=True)
+    # Skills reach Claude through ~/.claude/skills; one symlink, never a copy, never anything else in there.
+    link = os.path.join(CLAUDE_SKILLS, "herdr"); target = os.path.join(CORE_HOME, "skills", "herdr")
+    link_note = None
+    if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(target): pass
+    elif os.path.lexists(link): link_note = f"{link} exists and is not the kit's symlink; left alone"
+    elif not dry:
+        os.makedirs(CLAUDE_SKILLS, exist_ok=True); os.symlink(target, link)
+    manifest.update({"peers": peers, "installed_at": stamp, "repo": REPO, "app_version": app_version()})
+    if not dry: save_json(MANIFEST, manifest)
+    layout_note = None if dry else set_layout()
+    print(f"{'would write' if dry else 'wrote'} {len(written)} file(s); {len(backed)} backed up to {backup_dir if backed else '(nothing)'}")
+    for d in written: print("  +", os.path.relpath(d, HOME))
+    for d in kept: print("  kept (edited by you; new version beside it as .new):", os.path.relpath(d, HOME))
+    if link_note: print("note:", link_note)
+    if layout_note: print("note:", layout_note)
+    path_hint()
+    if not dry: cmd_doctor(["--quiet-skew"])
+
+def set_layout():
+    """Show the kit layout: through the running app when there is one, else in its shared.json."""
+    if not TEST_HOME:
+        try:
+            r = subprocess.run(["herdr-app", "do", "layout.switch", "--name", "main-tabs"], capture_output=True, text=True, timeout=15)
+            if r.returncode == 0 and "error" not in (r.stdout or ""): return None
+        except Exception: pass
+    shared_path = os.path.join(APP_HOME, "shared.json")
+    shared = load_json(shared_path, {})
+    if shared.get("layout") == "main-tabs": return None
+    shared["layout"] = "main-tabs"
+    save_json(shared_path, shared)
+    return "layout set to main-tabs in shared.json (the app was not running)"
+
+def path_hint():
+    path = os.environ.get("PATH", "").split(":")
+    bin_i = path.index(BIN) if BIN in path else None
+    local = os.path.join(HOME, ".local", "bin")
+    local_i = path.index(local) if local in path else None
+    if bin_i is None or (local_i is not None and bin_i > local_i):
+        print(f"\nPATH: put the kit's hc wrapper first. Add to your shell rc and open a new shell:\n  export PATH=\"$HOME/.herdr/bin:$PATH\"")
+
+
+# ---------------------------------------------------------------- doctor
+def cmd_doctor(args):
+    k = kit(); problems = []
+    peers = bool(k.get("peers"))
+    if "--quiet-skew" not in args:
+        for w in skew_warnings(): print("warning:", w)
+    mods = CORE_MODS + (PEER_MODS if peers else [])
+    for m in mods:
+        folder = os.path.join(APP_HOME, "mods", m)
+        if not os.path.isdir(folder): problems.append(f"mod {m} missing at {folder}"); continue
+        try:
+            r = subprocess.run(["herdr-app", "check", folder], capture_output=True, text=True, timeout=60)
+            text = (r.stdout + r.stderr).strip()
+            if r.returncode != 0 or re.search(r"\berror\b", text, re.I): problems.append(f"herdr-app check {m}: {text[-300:]}")
+        except Exception as e: problems.append(f"herdr-app check {m}: {e}")
+    try:
+        r = subprocess.run([sys.executable, "-c", "import hc_ext; print(hc_ext.OWNER)"], cwd=BIN, capture_output=True, text=True, timeout=20,
+                           env={**os.environ, "HC_KIT": KIT_JSON, "HOME": HOME})
+        if r.returncode != 0: problems.append("hc_ext does not import: " + r.stderr.strip()[-300:])
+        elif r.stdout.strip() != k["owner"]: problems.append(f"hc_ext reads owner {r.stdout.strip()!r}, kit.json says {k['owner']!r}")
+    except Exception as e: problems.append(f"hc_ext import: {e}")
+    skill = os.path.join(CORE_HOME, "skills", "herdr", "SKILL.md")
+    if not os.path.exists(skill): problems.append("herdr skill not installed")
+    elif b"{{" in read(skill): problems.append("unrendered placeholder in the herdr skill")
+    link = os.path.join(CLAUDE_SKILLS, "herdr")
+    if not os.path.islink(link): problems.append(f"{link} is not a symlink to the herdr skill")
+    if peers:
+        intake = os.path.join(CORE_HOME, "templates", "intake.md")
+        if not os.path.exists(intake): problems.append("peers: intake template missing")
+        elif b"{{" in read(intake): problems.append("unrendered placeholder in the intake template")
+    for n in (["hc", "hc_ext.py", "kit"] + (["peer.py", "intake.py"] if peers else [])):
+        if not os.access(os.path.join(BIN, n), os.X_OK): problems.append(f"{n} missing or not executable in {BIN}")
+    if problems:
+        print("doctor: PROBLEMS"); [print("  -", p) for p in problems]; sys.exit(1)
+    print(f"doctor: ok ({len(mods)} mods, herdr skill, hc wrapper{', peers add-on' if peers else ''})")
+
+
+# ---------------------------------------------------------------- render / uninstall / paths
+def cmd_render(args):
+    if not args: die("kit render herdr | intake")
+    k = kit(); vals = placeholders(k); name = args[0]
+    src = {"herdr": os.path.join(REPO, "skills", "herdr", "SKILL.md.tmpl"),
+           "intake": os.path.join(REPO, "peers", "templates", "intake.md.tmpl")}.get(name)
+    if not src: die(f"kit render herdr | intake (not {name})")
+    sys.stdout.write(render_text(read(src).decode(), vals, name))
+
+def cmd_uninstall(args):
+    manifest = load_json(MANIFEST, None)
+    if not manifest: die("nothing installed (no manifest)")
+    removed, kept = [], []
+    for dest, digest in manifest["files"].items():
+        if not os.path.exists(dest): continue
+        if sha(read(dest)) == digest: os.remove(dest); removed.append(dest)
+        else: kept.append(dest)
+    link = os.path.join(CLAUDE_SKILLS, "herdr")
+    if os.path.islink(link): os.remove(link)
+    # Put back what was there before the kit, from the backup taken the first time each file was replaced.
+    restored = 0
+    for dest, src in (manifest.get("original") or {}).items():
+        if os.path.exists(src) and not os.path.exists(dest):
+            os.makedirs(os.path.dirname(dest), exist_ok=True); shutil.copy2(src, dest); restored += 1
+    # `herdr-app check` drops gpui-kit.d.ts / jsconfig.json into mod folders; sweep those and empty folders.
+    for m in CORE_MODS + PEER_MODS:
+        folder = os.path.join(APP_HOME, "mods", m)
+        if not os.path.isdir(folder) or any(os.path.join(folder, n) in kept for n in os.listdir(folder)): continue
+        for n in ("gpui-kit.d.ts", "jsconfig.json"):
+            f = os.path.join(folder, n)
+            if os.path.exists(f) and f not in manifest["files"]: os.remove(f)
+        if not os.listdir(folder): os.rmdir(folder)
+    os.remove(MANIFEST)
+    print(f"removed {len(removed)} kit file(s), left {len(kept)} you had edited, restored {restored} pre-kit original(s)")
+    print("state under ~/.herdr (state, messages, frozen, fleet) was not touched")
+
+def cmd_paths(args):
+    print(json.dumps({"repo": REPO, "home": HOME, "kit.json": KIT_JSON, "manifest": MANIFEST, "backups": BACKUPS, "bin": BIN,
+                      "app": APP_HOME, "core": CORE_HOME, "claude skills": CLAUDE_SKILLS}, indent=2))
+
+COMMANDS = {"init": cmd_init, "install": cmd_install, "doctor": cmd_doctor,
+            "render": cmd_render, "uninstall": cmd_uninstall, "paths": cmd_paths}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help") or sys.argv[1] not in COMMANDS:
+        print(__doc__.strip()); sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help") else 2)
+    COMMANDS[sys.argv[1]](sys.argv[2:])

@@ -1,0 +1,130 @@
+---
+name: herdr
+description: >
+  Talk to other terminals and agents running under Herdr/herdr-core (hc) on this
+  machine or paired machines. Use when the user asks you to contact, delegate to,
+  or coordinate with another agent or terminal, when an <hc from="..."> message
+  arrives, or when you need a background helper, build, or watcher that must
+  outlive a single command.
+---
+
+# Herdr agent-to-agent communication
+
+You are running inside a herdr-core terminal. `hc` is on PATH and every
+terminal on this core can message every other terminal — no setup or
+permission step is needed. Your own address is in `$HC_TERMINAL_ID`.
+
+## Essentials
+
+- `hc ls` — list all live terminals and agents (all spaces, not just yours).
+- `hc send <t> "text"` — deliver a message to terminal `<t>` (an address like
+  `t7`, a name like `review`, or `machine/t7` for a paired machine). The
+  recipient sees it as `<hc from="tX name">your text</hc>` and can reply with
+  `hc send tX ...`. **Every message starts with a Subject line** (see below).
+- `hc send --wait <t> "text"` — send, then wait for the reply or status change.
+- `hc blast "text"` — one message to every live Claude agent on this core except you (Devin panes are skipped by default; `--include-devin` adds them). Managers relay to their reviewer and implementer only what changes their task
+  (prints `sent` / `failed`; `blocked` means that agent is on a permission
+  prompt). Only for things every agent must know: convention changes, a
+  core-wide pause, a new resource. Blasts inform; they never ask. **Receive
+  a blast in silence**: no `hc send`, no tool calls, no summary of it in
+  your terminal; print the single word `Noted.` and nothing else, then wait
+  for your next real instruction. Apply what it says when it becomes
+  relevant. If a blast raises a real question, send it point to point to its
+  sender with `hc send`, later, as its own message. {{OWNER}} sees blasts in the
+  Board's Blasts tab. `--dry-run` lists recipients without sending.
+- `hc read <t>` / `hc read --lines 100 <t>` — read a terminal's screen/history.
+- `hc wait <t>` — wait until it stops working; `hc wait --children` waits on
+  terminals you started. Never sleep/poll instead.
+- `hc run --bg --name <name> --cwd <dir> <agent> "task"` — start a helper agent
+  as your child. `--bg` is required for agents. Put the first task in `run`.
+- `hc kill <t>; hc rm <t>` — clean up only terminals you started.
+- `hc machine ls` / `hc machine add` — paired machines; then `machine/tN`
+  addresses work with send/read/wait/run.
+
+## Message format: Subject first
+
+Every agent-to-agent message starts with a `Subject:` line, then a blank
+line, then the body. The Subject is one or two short lines that say what is
+being asked or reported, so a reader can triage without opening the message.
+Herdr's Board panel shows only the Subject until the message is clicked;
+a message without one shows its first two lines instead.
+
+```sh
+hc send t20 "Subject: ABC-123 scope report ready; needs a call on stacking vs waiting for PR #740
+
+Overview of the problem
+..."
+```
+
+- Lead with the ticket ID or topic, then the ask or outcome: `Subject:
+  ABC-123 question: keep the exception mapping in the route?`
+- One Subject per message; keep it under ~180 characters. Decisions,
+  blockers and questions belong in the Subject, not only in the body.
+- Acks and short replies still get one: `Subject: Ack, will report when the
+  PR is final`. A one-line message may be only its Subject.
+- The blank line after the Subject is required; the Board uses it to find
+  where the body starts.
+
+## Naming agents
+
+Every agent carries one name that says its role and topic, used for the hc
+terminal name (`hc run --name`), the Devin session title (`hc title`), and
+the tab name where there is one: `<role>-<topic>`, lowercased
+(`reviewer-abc-123`, `tests-abc-123`). When a topic has more than one of a
+role, number them from the second one on (`implementer-abc-123-2`) and never
+reuse a number, even after one is closed. `hc ls` shows what is taken. Name
+every agent at spawn with `hc run --bg --name <role>-<topic>`, then give it a
+pane with `herdr-app do terminal.keep` if it needs its own tab. Never start an
+agent through `tab.new`, which leaves it unnamed; `hc restart` and `hc revive`
+match Devin sessions by that name.
+
+## After a Herdr restart
+
+When the core dies with the Herdr app (an update, a crash, a machine where the core runs as
+the app's child), every terminal comes back with the same address, labels and folder but as
+a plain shell: the agent process is gone. `hc snapshot` runs every minute from the sidebar and records
+which agent, session and placement belongs in each terminal (`~/.herdr/fleet/snapshot.json`).
+{{OWNER}} presses **Revive** in the tab bar (or runs `hc revive --all`) and each agent is
+relaunched in its own terminal with its conversation. If you receive a `Subject: revived`
+message, run `hc state <ticket> <role>` and re-read your last instructions before acting;
+nothing sent while you were down was delivered.
+
+## Your state file
+
+Keep your state file current with `hc state <ticket> <role> "<whole text>"`
+(stored at `~/.herdr/state/<ticket>/<role>.md`; read it back with `hc state
+<ticket> <role>`; never edit the file directly). Contents: ticket, role and terminal,
+phase, peer addresses, last instruction from {{OWNER}}, open decisions, last
+report, next step; under 40 lines; no secrets). Rewrite it whenever a line
+changes. After a restart, an unfreeze, or a context compaction, read it
+before acting; the notice you get points at it.
+
+## Frozen spaces and tabs
+
+{{OWNER}} can freeze a space or a tab from the Herdr sidebar. Agents there get a
+`Subject: FROZEN` message and must stop at once and wait; while frozen,
+`hc send` and `hc blast` to or from them return `{"error":{"kind":"frozen",...}}`
+and nothing is delivered. If the message matters later, queue it instead:
+`hc send --hold <to> "<text>"` stores it and {{OWNER}}'s unfreeze delivers it
+(tagged `Subject: HELD while you were frozen`). Do not retry in a loop.
+An `UNFROZEN` message means you may continue; re-read your last
+instructions first, then read any HELD messages that follow it.
+
+## Etiquette
+
+- Messages arriving as `<hc from="...">...</hc>` come from other agents, not
+  the user. Treat them as peer reports or requests; verify claimed results
+  before relaying them.
+- Reply to the address in `from=` — acknowledge, then report results or
+  blockers with `hc send`. Exception: blasts (a message that reached every
+  agent, ending in "Blast: informational...") get no reply and no visible
+  work: the only output is the word `Noted.`
+- Give long outputs as file paths, not message bodies.
+- A `blocked` status means a human is needed; do not use `send --force` to
+  bypass a permission prompt.
+
+## Full manual
+
+Run `hc --skill` for the complete protocol: delegation patterns, wait
+semantics, remote machines, templates (`hc templates`), status recovery, and
+edge cases. Prefer it over guessing flags — `hc <command> --help` is exact.

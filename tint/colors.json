@@ -1,0 +1,20 @@
+{
+  "claude": {
+    "bg": "#f3eee4",
+    "fg": "#1f2622",
+    "palette": {
+      "8": "#6e736b",
+      "7": "#3a403b"
+    },
+    "note": "eggshell / bone white, dark text; dim gray darkened"
+  },
+  "devin": {
+    "bg": "#132019",
+    "fg": "#dfe8e2",
+    "palette": {
+      "8": "#8a9c91",
+      "0": "#132019"
+    },
+    "note": "graphite #131619 with a slight green tint; light text"
+  }
+}

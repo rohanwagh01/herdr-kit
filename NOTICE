@@ -1,0 +1,22 @@
+herdr-kit
+Copyright 2026 Rohan Wagh
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This kit installs over Herdr (https://herdr.dev). The mods below are modified
+copies of mods shipped with the Herdr app, which is licensed under the Apache
+License, Version 2.0 by its authors. Each file carries a notice naming the mod
+and version it was copied from; mod.json records the same under "cloned_from".
+
+  mods/changes-cos            from Herdr's "changes" mod, version 0.1.13
+  mods/files-cos              from Herdr's "files" mod, version 0.1.13
+  mods/tabs-board             from Herdr's "tabs" mod, version 0.1.12
+  mods/spaces-tabs            from Herdr's "spaces" mod, version 0.1.12
+  mods/menu-cos               from Herdr's "menu" mod, version 0.1.13
+  peers/mods/spaces-tabs-social   from "spaces" 0.1.12, by way of mods/spaces-tabs
+  peers/mods/menu-cos-social      from "menu" 0.1.13, by way of mods/menu-cos
+
+Everything else (bin/, skills/, layouts/, tint/, mods/message-board,
+peers/bin, peers/mods/peer-chat, peers/mods/machine-add) is original work in
+this repository. Herdr is a trademark of its owners; this kit is not published
+or endorsed by them.

@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to ~/.herdr/kit.json (install.sh does this and asks for each value). Every {{KEY}} in the kit's .tmpl files is the upper-cased key here. Values must not contain double quotes or newlines.",
+
+  "owner": "Ada",
+  "_owner": "Your first name. Agents see it in freeze, restart and revive notices.",
+
+  "org_domain": "@yourcompany.com",
+  "_org_domain": "Peers add-on only: tailnet logins must end with this to connect to your core.",
+
+  "services": {},
+  "_services": "Plain programs `hc revive` should bring back after a Herdr restart, by hc terminal name: {\"poller\": \"python3 poll.py\"}.",
+
+  "peers": false,
+  "_peers": "Set by install.sh --with-peers. Enables hc social/inbox/peer/intake/share over Tailscale."
+}

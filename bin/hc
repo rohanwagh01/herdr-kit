@@ -1,0 +1,12 @@
+#!/bin/sh
+# Herdr wrapper around the real hc: logs `hc send` for the Board, adds `hc blast`
+# (one message to every agent), `hc freeze|unfreeze|frozen` (the owner's freeze of a
+# space or tab: agents there are stopped and messages to/from them are refused),
+# restart/snapshot/revive, and the peers add-on commands. Installed by herdr-kit.
+export HC_REAL="$HOME/.local/bin/hc"
+export HC_BOARD_DIR="$HOME/.herdr/messages"
+export HC_FROZEN="$HOME/.herdr/frozen/state.json"
+case "$1" in
+  send|blast|freeze|unfreeze|frozen|restart|title|state|tint|snapshot|revive|share|unshare|shared|approve|deny|requests|peer|intake|social|inbox) exec /usr/bin/python3 "$HOME/.herdr/bin/hc_ext.py" "$@" ;;
+esac
+exec "$HC_REAL" "$@"
